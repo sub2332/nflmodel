@@ -3097,14 +3097,17 @@ def build_why(r, gc, hist):
 def fetch_forecasts(wk):
     """
     {game_id: {"temp": F, "wind": mph, "gust": mph, "rain": chance %, "dome": bool}} at kickoff for each unplayed game.
-    Open-Meteo hourly forecast at the home stadium. Domes / closed roofs are marked and not fetched. Anything that fails
-    simply has no entry (the model then treats that game as calm and mild).
+    ONE Open-Meteo request covers every outdoor stadium (shared servers such as GitHub's get blocked when they send many
+    small requests), with a few retries. Domes / closed roofs are marked and not fetched. Anything that fails simply has no
+    entry (the model then treats that game as calm and mild) and the reason is printed.
     """
     import json
-    from datetime import timedelta, timezone
+    import time
+    from datetime import timedelta
     out = {}
     if not WEATHER_FORECAST:
         return out
+    todo = []
     for r in wk.itertuples():
         if pd.notna(r.result):
             continue
@@ -3114,32 +3117,62 @@ def fetch_forecasts(wk):
             continue
         lat_lon = TEAM_COORDS.get(r.home_team)
         if lat_lon is None or str(getattr(r, "location", "Home")) == "Neutral":
+            print(f"  (no forecast for {r.away_team} @ {r.home_team}: stadium location not known)")
             continue
         try:
             day = pd.to_datetime(r.gameday)
             hh, mm = (str(getattr(r, "gametime", "13:00") or "13:00").split(":") + ["0"])[:2]
             ko_et = day.to_pydatetime().replace(hour=int(hh), minute=int(mm))
-            # gametime is Eastern: UTC-5 after the clocks go back (early Nov), UTC-4 before (approx. DST by date)
-            is_dst = pd.Timestamp(ko_et).month in (3, 4, 5, 6, 7, 8, 9, 10) and not (pd.Timestamp(ko_et).month == 3 and pd.Timestamp(ko_et).day < 9)
-            ko_utc = ko_et + timedelta(hours=4 if is_dst else 5)
+            is_dst = (3 < ko_et.month < 11) or (ko_et.month == 3 and ko_et.day >= 9) or (ko_et.month == 11 and ko_et.day < 2)
+            ko_utc = ko_et + timedelta(hours=4 if is_dst else 5)             # gametime is Eastern
             if (ko_utc - datetime.utcnow()).days > 14:
+                print(f"  (no forecast yet for {r.away_team} @ {r.home_team}: more than two weeks away)")
                 continue
-            url = ("https://api.open-meteo.com/v1/forecast?latitude={:.3f}&longitude={:.3f}"
-                   "&hourly=temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation_probability"
-                   "&temperature_unit=fahrenheit&wind_speed_unit=mph&forecast_days=16&timezone=UTC").format(*lat_lon)
-            with urllib.request.urlopen(url, timeout=20) as resp:
-                d = json.loads(resp.read().decode("utf-8"))["hourly"]
-            want = ko_utc.strftime("%Y-%m-%dT%H:00")
-            i = d["time"].index(want)
-            hrs = range(i, min(i + 3, len(d["time"])))                     # about the length of the game
-            g_ = lambda k: [d[k][j] for j in hrs if d.get(k) and d[k][j] is not None]
-            out[r.game_id] = {"temp": float(np.mean(g_("temperature_2m"))), "wind": float(np.mean(g_("wind_speed_10m"))),
-                              "gust": float(np.max(g_("wind_gusts_10m"))), "rain": float(np.max(g_("precipitation_probability"))),
-                              "dome": False}
+            todo.append((r.game_id, lat_lon, ko_utc.strftime("%Y-%m-%dT%H:00"), r.away_team, r.home_team))
         except Exception as ex:
-            print(f"  ! no forecast for {r.away_team} @ {r.home_team} ({ex})")
+            print(f"  ! no forecast for {r.away_team} @ {r.home_team} (kickoff time not understood: {ex})")
+    if not todo:
+        return out
+    url = ("https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}"
+           "&hourly=temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation_probability"
+           "&temperature_unit=fahrenheit&wind_speed_unit=mph&forecast_days=16&timezone=UTC").format(
+        ",".join(f"{t[1][0]:.3f}" for t in todo), ",".join(f"{t[1][1]:.3f}" for t in todo))
+    data, last = None, ""
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "nfl-predictor/1.0 (personal project)"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except Exception as ex:
+            body = ""
+            try:
+                body = ex.read().decode("utf-8", "ignore")[:200]          # HTTPError carries the server's explanation
+            except Exception:
+                pass
+            last = f"{type(ex).__name__}: {ex} {body}".strip()
+            time.sleep(2 * (attempt + 1))
+    if data is None:
+        print(f"  ! weather forecast request failed after 3 tries: {last}")
+        return out
+    if isinstance(data, dict):
+        if data.get("error"):
+            print(f"  ! weather service refused the request: {data.get('reason')}")
+            return out
+        data = [data]
+    for t, d in zip(todo, data):
+        try:
+            h = d["hourly"]
+            i = h["time"].index(t[2])
+            hrs = range(i, min(i + 3, len(h["time"])))                         # about the length of the game
+            g_ = lambda k: [h[k][j] for j in hrs if h.get(k) and h[k][j] is not None]
+            out[t[0]] = {"temp": float(np.mean(g_("temperature_2m"))), "wind": float(np.mean(g_("wind_speed_10m"))),
+                         "gust": float(np.max(g_("wind_gusts_10m"))), "rain": float(np.max(g_("precipitation_probability"))),
+                         "dome": False}
+        except Exception as ex:
+            print(f"  ! no forecast for {t[3]} @ {t[4]} (kickoff hour {t[2]} not in the forecast: {ex})")
     got = sum(1 for v in out.values() if not v.get("dome") and "temp" in v)
-    print(f"Weather forecasts: {got} outdoor game(s) found" + ("" if got else " (none; treating games as calm and mild)"))
+    print(f"Weather forecasts: {got} of {len(todo)} outdoor game(s) found" + ("" if got else " (treating games as calm and mild)"))
     return out
 
 
