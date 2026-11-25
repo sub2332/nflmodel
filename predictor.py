@@ -329,6 +329,9 @@ INJURY_RECEIVING_SHARE = True  # its own factor: the share of a team's targets t
                                # (so losing a 40%-of-targets star with nobody behind him hurts a lot)
 INJURY_INCLUDE_IR = True       # players on injured reserve (roster status "RES") count as Out for the week being predicted.
                                # The weekly injury report does not list them, so without this a star on IR would be invisible.
+INJURY_RZ_SHARE = True         # receivers who get a big share of the team's red-zone targets (inside the 20) count a little more
+                               # when out (a bump of up to +30%, based on the last 12 games); the comparison table tests it
+RZ_SHOW_MIN = 0.25             # a card shows the red-zone line when missing receivers had at least this share of the team's red-zone targets
 IR_WEIGHT_SCALE = 0.5          # how much a player on injured reserve counts compared with the same player listed Out (1.0 = fully;
                                # the "injured reserve" rows of the comparison table test 0 and 0.5 on past seasons)
 INJURY_BY_POSITION = not INJURY_PLAYER_IMPACT
@@ -336,6 +339,7 @@ KEY_PLAYER_W = 1.2             # a missing player at or above this weight is cal
 INJ_WEEK_NOW = 0               # the week those two tables belong to
 INJ_KEY_NOW = {}               # {team: [(weight, name, position, status)]} for the week being predicted (filled by build_injury_table)
 INJ_IMPACT_NOW = {}            # {(team, gsis_id): weight} same week, used by the injury report tables
+INJ_RZ_NOW = {}                # {team: [(share of red-zone targets, name, label)]} receivers who are out, same week
 INJ_LOST_NOW = {}              # {team: [(share of targets counted, name, status)]} receivers who are out, same week
 INJ_GROUPS = {"ol": ["T", "OT", "LT", "RT", "G", "OG", "C", "OL"],
               "dl": ["DE", "OLB", "EDGE", "DT", "NT", "DL"],
@@ -1852,14 +1856,18 @@ def load_target_quality(pbp):
     at his position, shrunk toward 1 and limited to 0.7-1.8. Table (gsis_id, t, rq) looked up as of before a given week.
     """
     try:
-        d = pbp[(pbp["play_type"] == "pass") & pbp["receiver_player_id"].notna()]
-        d = d.groupby(["receiver_player_id", "posteam", "season", "week"]).size().rename("tgt").reset_index()
+        d = pbp[(pbp["play_type"] == "pass") & pbp["receiver_player_id"].notna()].copy()
+        d["rz_"] = (pd.to_numeric(d["yardline_100"], errors="coerce") <= 20).astype(int) if "yardline_100" in d.columns else 0
+        d = d.groupby(["receiver_player_id", "posteam", "season", "week"]).agg(tgt=("rz_", "size"), rz=("rz_", "sum")).reset_index()
         d = d.rename(columns={"receiver_player_id": "gsis_id"})
+        _rzt = d.groupby(["posteam", "season", "week"])["rz"].transform("sum")
+        d["rz_g"] = np.where(_rzt > 0, d["rz"] / _rzt.where(_rzt > 0), np.nan)             # share of the team's red-zone targets that game
         d["share_g"] = d["tgt"] / d.groupby(["posteam", "season", "week"])["tgt"].transform("sum")   # share of the team's targets that game
         d["t"] = d["season"].astype(int) * 100 + d["week"].astype(int)
         d = d.sort_values(["gsis_id", "t"])
         d["roll"] = d.groupby("gsis_id")["tgt"].transform(lambda x: x.rolling(12, min_periods=3).mean())
         d["share"] = d.groupby("gsis_id")["share_g"].transform(lambda x: x.rolling(12, min_periods=3).mean())
+        d["rz_share"] = d.groupby("gsis_id")["rz_g"].transform(lambda x: x.rolling(12, min_periods=3).mean())
         d = d.dropna(subset=["roll"])
         cls = pd.Series("wr", index=d.index)
         try:
@@ -1872,7 +1880,10 @@ def load_target_quality(pbp):
         d["cls"] = cls
         base = d.groupby("cls")["roll"].transform(lambda x: x[x >= x.median()].mean())
         d["rq"] = np.clip(1.0 + 0.6 * (d["roll"] / base.where(base > 0) - 1.0), 0.7, 1.8).fillna(1.0)
-        return d[["gsis_id", "t", "rq", "share"]].sort_values("t")
+        # red-zone bump: how much more (or less) of the red-zone targets he gets than of the targets overall
+        d["rzm"] = np.where(d["share"] >= 0.05, np.clip(1.0 + 0.5 * (d["rz_share"] / d["share"] - 1.0), 0.85, 1.3), 1.0)
+        d["rzm"] = pd.Series(d["rzm"], index=d.index).fillna(1.0)
+        return d[["gsis_id", "t", "rq", "share", "rz_share", "rzm"]].sort_values("t")
     except Exception as ex:
         print(f"  ! receiver target volumes unavailable ({ex}); missing receivers count by depth chart only")
         return None
@@ -2055,7 +2066,7 @@ def build_injury_table(tg, pbp=None):
     Only 'Out' / 'Doubtful' players count. No shift(1): the report precedes kickoff.
     """
     empty = pd.DataFrame(columns=["team", "season", "week", "qb_out", "inj_score", "wr_lost", "inj_score_v0", "inj_score_v5",
-                                  "wr_lost_v0", "wr_lost_v5"] + INJ_GROUP_COLS)
+                                  "wr_lost_v0", "wr_lost_v5", "inj_score_nz"] + INJ_GROUP_COLS)
     try:
         inj = to_pandas(nfl.load_injuries(SEASONS))
     except Exception as e:
@@ -2131,6 +2142,8 @@ def build_injury_table(tg, pbp=None):
     inj["wq"] = np.nan
     inj["cq"] = np.nan
     inj["wshare"] = np.nan
+    inj["rzshare"] = np.nan
+    inj["rzm"] = np.nan
     for col, loader, on_ in (("rq", load_rush_quality, INJURY_STAR_QUALITY),
                              ("wq", (lambda: load_target_quality(pbp)) if pbp is not None else (lambda: None), INJURY_WR_QUALITY),
                              ("cq", load_cb_quality, INJURY_CB_QUALITY)):
@@ -2140,11 +2153,15 @@ def build_injury_table(tg, pbp=None):
             o["i"] = o.index
             m = pd.merge_asof(o, tbl_, on="t", by="gsis_id", allow_exact_matches=False)
             inj.loc[m["i"].values, col] = m["rq"].values
+            if col == "wq" and "rz_share" in m.columns:
+                inj.loc[m["i"].values, "rzshare"] = m["rz_share"].values
+                inj.loc[m["i"].values, "rzm"] = m["rzm"].values
             if col == "wq" and "share" in m.columns:
                 inj.loc[m["i"].values, "wshare"] = m["share"].values
 
-    def weight(r):
+    def weight(r, rz=True):
         pos, pid = r["position"], r["gsis_id"]
+        rzf = float(r["rzm"]) if (rz and INJURY_RZ_SHARE and pd.notna(r["rzm"])) else 1.0   # red-zone receivers count a bit more
         is_ir = str(r.get("report_primary_injury", "")) == "Injured reserve"
         if is_ir:
             # injured-reserve list: only players who actually played for the team THIS season count (not practice-squad
@@ -2154,7 +2171,7 @@ def build_injury_table(tg, pbp=None):
         if pos == "QB":                       # only the expected STARTER counts, scaled by the backup gap
             return QB_WEIGHT * r["qb_mult"] if pid == r["qb_id"] else 0.0
         if pos == "WR":
-            wm = 1.0 if pd.isna(r["wq"]) else float(r["wq"])      # heavily targeted receivers count more
+            wm = (1.0 if pd.isna(r["wq"]) else float(r["wq"])) * rzf      # heavily targeted receivers count more
             if pid == r["wr1_id"]:
                 return KEY_SKILL_WEIGHT * wm
             if pid == r["wr2_id"]:
@@ -2181,19 +2198,21 @@ def build_injury_table(tg, pbp=None):
             if pos in RUSH_CLASS and pd.notna(r["rq"]):
                 f *= float(r["rq"])              # productive pass rushers / linebackers count more
             if pos == "TE" and pd.notna(r["wq"]):
-                f *= float(r["wq"])              # heavily targeted tight ends count more
+                f *= float(r["wq"]) * rzf        # heavily targeted tight ends count more
             if pos == "CB" and pd.notna(r["cq"]):
                 f *= float(r["cq"])              # corners who have covered well count more
             return base * f
         return base
 
     inj["w_raw"] = inj.apply(weight, axis=1) * inj["sev"]
+    inj["w_nz"] = (inj.apply(lambda r_: weight(r_, rz=False), axis=1) * inj["sev"]) if INJURY_RZ_SHARE else inj["w_raw"]   # without the red-zone bump
     inj["is_ir"] = inj["report_primary_injury"].astype(str).eq("Injured reserve") if "report_primary_injury" in inj.columns else False
     inj["w"] = inj["w_raw"] * np.where(inj["is_ir"], IR_WEIGHT_SCALE, 1.0)
     # remember this week's missing players (for names on the game cards and the impact column in the injury report)
     INJ_KEY_NOW.clear()
     INJ_IMPACT_NOW.clear()
     INJ_LOST_NOW.clear()
+    INJ_RZ_NOW.clear()
     cur = inj[inj["season"] == PREDICT_SEASON]
     if len(cur):
         cur = cur[cur["week"] == cur["week"].max()]
@@ -2210,12 +2229,17 @@ def build_injury_table(tg, pbp=None):
                 lab_ = ("injured reserve, counted at " + f"{IR_WEIGHT_SCALE * 100:.0f}%" + " in the model") if (x.get("is_ir") and IR_WEIGHT_SCALE != 1.0) \
                     else ("injured reserve" if x.get("is_ir") else x["status"])
                 INJ_LOST_NOW.setdefault(x["team"], []).append((sh_, x["pname"], lab_))
+                if pd.notna(x.get("rzshare")) and x["rzshare"] > 0:
+                    INJ_RZ_NOW.setdefault(x["team"], []).append((float(x["rzshare"]), x["pname"], lab_))
             if x["w"] >= KEY_PLAYER_W and x["pname"]:
-                INJ_KEY_NOW.setdefault(x["team"], []).append((float(x["w"]), x["pname"], x["position"], x["status"]))
+                INJ_KEY_NOW.setdefault(x["team"], []).append((float(x["w"]), x["pname"], x["position"],
+                                                              "injured reserve" if x.get("is_ir") else x["status"]))
         for t_ in INJ_KEY_NOW:
             INJ_KEY_NOW[t_].sort(key=lambda z: -z[0])
         for t_ in INJ_LOST_NOW:
             INJ_LOST_NOW[t_].sort(key=lambda z: -z[0])
+        for t_ in INJ_RZ_NOW:
+            INJ_RZ_NOW[t_].sort(key=lambda z: -z[0])
     inj["qb_flag"] = ((inj["position"] == "QB") & (inj["gsis_id"] == inj["qb_id"])).astype(int)
     pos_group = {p: g for g, ps in INJ_GROUPS.items() for p in ps}
     inj["grp"] = inj["position"].map(pos_group)
@@ -2224,13 +2248,14 @@ def build_injury_table(tg, pbp=None):
     lost_raw = np.where(inj["position"].isin(["WR", "TE"]), inj["wshare"].fillna(0.0) * inj["sev"], 0.0)
     inj["lost_share"] = lost_raw * np.where(inj["is_ir"], IR_WEIGHT_SCALE, 1.0)
     # the same two numbers with injured reserve ignored (v0) or at half weight (v5), for the comparison table
+    inj["w_nz"] = inj["w_nz"] * np.where(inj["is_ir"], IR_WEIGHT_SCALE, 1.0)
     for tag, sc in (("v0", 0.0), ("v5", 0.5)):
         k = np.where(inj["is_ir"], sc, 1.0)
         inj["w_" + tag] = inj["w_raw"] * k
         inj["lost_" + tag] = lost_raw * k
     agg = (inj.groupby(["team", "season", "week"])
               .agg(qb_out=("qb_flag", "max"), inj_score=("w", "sum"), wr_lost=("lost_share", "sum"),
-                   inj_score_v0=("w_v0", "sum"), inj_score_v5=("w_v5", "sum"),
+                   inj_score_v0=("w_v0", "sum"), inj_score_v5=("w_v5", "sum"), inj_score_nz=("w_nz", "sum"),
                    wr_lost_v0=("lost_v0", "sum"), wr_lost_v5=("lost_v5", "sum"),
                    **{c: (c, "sum") for c in INJ_GROUP_COLS}).reset_index())
     return agg
@@ -2240,7 +2265,7 @@ def build_injury_table(tg, pbp=None):
 # 7. MATCHUP FEATURES
 # ----------------------------------------------------------------------------
 TEAM_FEATS = ["anya_off_pre", "anya_def_pre", "epa_off_pre", "epa_def_pre", "net_epa_pre",
-              "sos", "sos_adj_net_epa", "qb_out", "inj_score", "wr_lost", "inj_score_v0", "inj_score_v5", "wr_lost_v0", "wr_lost_v5",
+              "sos", "sos_adj_net_epa", "qb_out", "inj_score", "wr_lost", "inj_score_v0", "inj_score_v5", "wr_lost_v0", "wr_lost_v5", "inj_score_nz",
               "hfa_pre"] + INJ_GROUP_COLS + [
               "rz_off_pre", "rz_def_pre", "tov_margin_pre", "expl_off_pre", "expl_def_pre",
               "succ_off_pre", "succ_def_pre", "off_unit", "def_unit", "off_rank", "def_rank",
@@ -2284,6 +2309,7 @@ def build_matchups(sched, tg, elo):
     g["qb_out_diff"] = g["a_qb_out"] - g["h_qb_out"]
     g["injury_score_diff"] = g["a_inj_score"] - g["h_inj_score"]
     g["wr_lost_diff"] = g["a_wr_lost"] - g["h_wr_lost"]
+    g["injury_score_diff_nz"] = g["a_inj_score_nz"] - g["h_inj_score_nz"]
     for _v in ("v0", "v5"):
         g["injury_score_diff_" + _v] = g["a_inj_score_" + _v] - g["h_inj_score_" + _v]
         g["wr_lost_diff_" + _v] = g["a_wr_lost_" + _v] - g["h_wr_lost_" + _v]
@@ -2553,6 +2579,9 @@ def compare_configs(games):
         sw5 = {"injury_score_diff": "injury_score_diff_v5", "wr_lost_diff": "wr_lost_diff_v5", "_swap": True}
         cfgs += [("Same, ignoring injured-reserve players", active, True, 1.0, {"_swap": sw0}),
                  ("Same, injured reserve at half weight", active, True, 1.0, {"_swap": sw5})]
+    if INJURY_RZ_SHARE and INJURY_PLAYER_IMPACT and "Injuries" in active:
+        cfgs.append(("Same, without the red-zone receiver bump", active, True, 1.0,
+                     {"_swap": {"injury_score_diff": "injury_score_diff_nz"}}))
     cfgs += [
             ("Same factors, all multipliers 1.0", active, False, 1.0),
             ("Same factors, stronger regularization", active, False, 0.05),
@@ -2989,6 +3018,16 @@ def build_why(r, gc, hist):
     def shown_pct(team, fallback):                    # what the card says: the real share of targets the missing receivers had
         k = INJ_LOST_NOW.get(team)
         return sum(sh for sh, _, _ in k) if k else fallback
+    def rz_line(team):
+        k = INJ_RZ_NOW.get(team, [])
+        tot = sum(x_[0] for x_ in k)
+        if tot < RZ_SHOW_MIN:
+            return None
+        top = [(sh, n_, st) for sh, n_, st in k if sh >= 0.01][:8]
+        return (tot, "\x1f" + "\x1e".join(f"{n_}: {sh * 100:.1f}% of red-zone targets ({st})" for sh, n_, st in top))
+    rzo, rzp = rz_line(O), rz_line(P)
+    if rzo:
+        reasons.append((0.25 + rzo[0] / 2, f"{O} is missing receivers who had about {rzo[0] * 100:.0f}% of their red-zone targets (inside the 20)." + rzo[1]))
     if lo_ >= 0.15:
         reasons.append((0.3 + lo_, f"{O} is missing receivers who had about {shown_pct(O, lo_) * 100:.0f}% of their targets." + lost_names(O)))
     if ko_o:
@@ -3015,6 +3054,8 @@ def build_why(r, gc, hist):
         cs.append((-v["Injuries"], f"{P} has more key injuries than {O}."))
     if int(g(pre, "qb_out")):
         cs.append((1.0, f"{P}'s usual starting quarterback is listed out, so the rating may overstate them."))
+    if rzp:
+        cs.append((0.75 + rzp[0] / 2, f"{P} is missing receivers who had about {rzp[0] * 100:.0f}% of their red-zone targets (inside the 20)." + rzp[1]))
     if lp_ >= 0.15:
         cs.append((0.8 + lp_, f"{P} is missing receivers who had about {shown_pct(P, lp_) * 100:.0f}% of their targets." + lost_names(P)))
     if ko_p:
@@ -4732,7 +4773,7 @@ def main():
     for c in INJ_GROUP_COLS:
         if c not in tg.columns:
             tg[c] = 0.0
-    _vc = ["inj_score_v0", "inj_score_v5", "wr_lost_v0", "wr_lost_v5"]
+    _vc = ["inj_score_v0", "inj_score_v5", "wr_lost_v0", "wr_lost_v5", "inj_score_nz"]
     for c in ["wr_lost"] + _vc:
         if c not in tg.columns:
             tg[c] = 0.0
