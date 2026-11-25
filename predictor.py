@@ -329,6 +329,8 @@ INJURY_RECEIVING_SHARE = True  # its own factor: the share of a team's targets t
                                # (so losing a 40%-of-targets star with nobody behind him hurts a lot)
 INJURY_INCLUDE_IR = True       # players on injured reserve (roster status "RES") count as Out for the week being predicted.
                                # The weekly injury report does not list them, so without this a star on IR would be invisible.
+IR_WEIGHT_SCALE = 1.0          # how much a player on injured reserve counts compared with the same player listed Out (1.0 = fully;
+                               # the "injured reserve" rows of the comparison table test 0 and 0.5 on past seasons)
 INJURY_BY_POSITION = not INJURY_PLAYER_IMPACT
 KEY_PLAYER_W = 1.2             # a missing player at or above this weight is called out by name on the game cards
 INJ_WEEK_NOW = 0               # the week those two tables belong to
@@ -1977,46 +1979,63 @@ _IR_CACHE = {}
 
 
 def ir_player_rows(tgt):
-    """Rows (same columns as the injury feed) for every player on a team's injured-reserve list in week tgt of this season."""
+    """
+    Rows (same columns as the injury feed) for every player on a team's injured-reserve list (roster status "RES"), for each
+    regular-season week of every season in SEASONS (so past games get the same treatment as the one being predicted).
+    For the week being predicted, the newest roster snapshot is used until that week's own snapshot exists.
+    """
     if not INJURY_INCLUDE_IR or tgt is None:
         return pd.DataFrame()
     if tgt in _IR_CACHE:
         return _IR_CACHE[tgt]
     out = pd.DataFrame()
     try:
-        ro = to_pandas(nfl.load_rosters_weekly(PREDICT_SEASON))
+        ro = to_pandas(nfl.load_rosters_weekly(SEASONS))
         st_c = first_col(ro, ["status", "roster_status"])
-        if st_c is None or "week" not in ro.columns or "gsis_id" not in ro.columns:
+        if st_c is None or not {"week", "season", "gsis_id", "team"} <= set(ro.columns):
             raise ValueError("roster columns not as expected")
-        ro = ro[ro["week"] <= tgt]
-        if ro.empty:
-            raise ValueError("no roster rows")
-        ro = ro[ro["week"] == ro["week"].max()]            # the newest roster snapshot (the predicted week's, once it exists)
+        if "game_type" in ro.columns:
+            ro = ro[ro["game_type"] == "REG"]
+        ro = ro[ro["week"] >= 1]
+        cur = ro[ro["season"] == PREDICT_SEASON]
+        ro = ro[(ro["season"] < PREDICT_SEASON) | (ro["week"] <= tgt)]
+        if len(cur) and not (ro[(ro["season"] == PREDICT_SEASON) & (ro["week"] == tgt)].shape[0]):
+            last = cur[cur["week"] <= tgt]["week"].max()           # this week's roster is not out yet: newest snapshot stands in
+            if pd.notna(last):
+                dup = ro[(ro["season"] == PREDICT_SEASON) & (ro["week"] == last)].copy()
+                dup["week"] = tgt
+                ro = pd.concat([ro, dup], ignore_index=True)
         ro = ro[ro[st_c].astype(str).str.upper() == "RES"].dropna(subset=["gsis_id"])
         pos_c = first_col(ro, ["depth_chart_position", "position"])
         nm_c = first_col(ro, ["full_name", "player_name", "football_name"])
         pos = ro[pos_c].astype(str).str.upper().str.strip()
         if "position" in ro.columns:                         # the roster's depth-chart label can be blank or coarse (DL, DB, OL)
             pos = pos.where(~pos.isin(["", "NAN", "NONE", "DL", "DB", "OL"]), ro["position"].astype(str).str.upper().str.strip())
-        out = pd.DataFrame({"season": PREDICT_SEASON, "season_type": "REG", "game_type": "REG",
-                            "team": fix_team(ro["team"]), "week": tgt, "gsis_id": ro["gsis_id"].values,
-                            "position": pos.values, "full_name": ro[nm_c].values if nm_c else "",
+        out = pd.DataFrame({"season": ro["season"].astype(int).values, "season_type": "REG", "game_type": "REG",
+                            "team": fix_team(ro["team"]).values, "week": ro["week"].astype(int).values,
+                            "gsis_id": ro["gsis_id"].values, "position": pos.values,
+                            "full_name": ro[nm_c].values if nm_c else "",
                             "report_status": "Out", "game_status": "Out",
                             "report_primary_injury": "Injured reserve", "practice_status": "Did Not Participate In Practice"})
-        print(f"  Injured reserve: {len(out)} players added as Out for week {tgt}.")
+        out = out.drop_duplicates(["team", "season", "week", "gsis_id"])
+        n_now = int(((out["season"] == PREDICT_SEASON) & (out["week"] == tgt)).sum())
+        print(f"  Injured reserve: {n_now} players on the lists for week {tgt}; {len(out) - n_now} player-weeks in past games.")
     except Exception as ex:
         print(f"  ! injured-reserve players not added ({ex})")
     _IR_CACHE[tgt] = out
     return out
 
 
-def add_ir_players(inj, tgt):
-    """Add injured-reserve players for week tgt (the feed already lists some; the feed's row is kept for those)."""
+def add_ir_players(inj, tgt, history=False):
+    """Add injured-reserve players (only the week being predicted, or every past week too when history=True).
+    The feed's own row is kept when it already lists the same player and week."""
     ir = ir_player_rows(tgt)
     if ir.empty:
         return inj
-    have = set(zip(inj.loc[inj["week"] == tgt, "gsis_id"], inj.loc[inj["week"] == tgt, "week"])) if len(inj) else set()
-    ir = ir[[(g_, w_) not in have for g_, w_ in zip(ir["gsis_id"], ir["week"])]]
+    if not history:
+        ir = ir[(ir["season"] == PREDICT_SEASON) & (ir["week"] == tgt)]
+    have = set(zip(inj["gsis_id"], inj["season"], inj["week"])) if len(inj) else set()
+    ir = ir[[(g_, s_, w_) not in have for g_, s_, w_ in zip(ir["gsis_id"], ir["season"], ir["week"])]]
     return pd.concat([inj, ir], ignore_index=True) if len(ir) else inj
 
 
@@ -2034,7 +2053,8 @@ def build_injury_table(tg, pbp=None):
     Per (team, season, week): qb_out flag + weighted key-position injury score.
     Only 'Out' / 'Doubtful' players count. No shift(1): the report precedes kickoff.
     """
-    empty = pd.DataFrame(columns=["team", "season", "week", "qb_out", "inj_score", "wr_lost"] + INJ_GROUP_COLS)
+    empty = pd.DataFrame(columns=["team", "season", "week", "qb_out", "inj_score", "wr_lost", "inj_score_v0", "inj_score_v5",
+                                  "wr_lost_v0", "wr_lost_v5"] + INJ_GROUP_COLS)
     try:
         inj = to_pandas(nfl.load_injuries(SEASONS))
     except Exception as e:
@@ -2066,7 +2086,7 @@ def build_injury_table(tg, pbp=None):
     if "season_type" not in inj.columns:
         inj["season_type"] = "REG"
     inj = add_manual_injuries(inj, tgt_)
-    inj = add_ir_players(inj, tgt_)
+    inj = add_ir_players(inj, tgt_, history=True)
     inj["status"] = inj[status_c].astype(str).str.strip().str.title()
     nm_c = first_col(inj, ["full_name", "player_name", "name"])
     if nm_c is not None:
@@ -2124,10 +2144,11 @@ def build_injury_table(tg, pbp=None):
 
     def weight(r):
         pos, pid = r["position"], r["gsis_id"]
-        if str(r.get("report_primary_injury", "")) == "Injured reserve":
+        is_ir = str(r.get("report_primary_injury", "")) == "Injured reserve"
+        if is_ir:
             # injured-reserve list: only players who actually played for the team THIS season count (not practice-squad
             # names or people who left long ago); their weight then follows the same rules as anyone else
-            if not have_snaps or pd.isna(r["snap_t"]) or r["snap_t"] < PREDICT_SEASON * 100:
+            if not have_snaps or pd.isna(r["snap_t"]) or r["snap_t"] < int(r["season"]) * 100:
                 return 0.0
         if pos == "QB":                       # only the expected STARTER counts, scaled by the backup gap
             return QB_WEIGHT * r["qb_mult"] if pid == r["qb_id"] else 0.0
@@ -2139,6 +2160,12 @@ def build_injury_table(tg, pbp=None):
                 return WR2_WEIGHT * wm
             if pid == r["wr3_id"]:
                 return WR3_WEIGHT * wm
+            if is_ir and pd.notna(r["wshare"]):
+                # on injured reserve for a while, so the depth chart has already moved on: rate him by the share of the
+                # team's targets he had, because THIS team is missing that player (the team without him is a different team)
+                sh = float(r["wshare"])
+                tier = KEY_SKILL_WEIGHT if sh >= 0.22 else (WR2_WEIGHT if sh >= 0.15 else (WR3_WEIGHT if sh >= 0.09 else 0.0))
+                return max(WR_DEPTH_WEIGHT, tier) * wm
             return WR_DEPTH_WEIGHT * wm
         if pos in ("RB", "FB", "HB"):
             if pid == r["rb1_id"]:
@@ -2159,13 +2186,19 @@ def build_injury_table(tg, pbp=None):
             return base * f
         return base
 
-    inj["w"] = inj.apply(weight, axis=1) * inj["sev"]
+    inj["w_raw"] = inj.apply(weight, axis=1) * inj["sev"]
+    inj["is_ir"] = inj["report_primary_injury"].astype(str).eq("Injured reserve") if "report_primary_injury" in inj.columns else False
+    inj["w"] = inj["w_raw"] * np.where(inj["is_ir"], IR_WEIGHT_SCALE, 1.0)
     # remember this week's missing players (for names on the game cards and the impact column in the injury report)
     INJ_KEY_NOW.clear()
     INJ_IMPACT_NOW.clear()
     cur = inj[inj["season"] == PREDICT_SEASON]
     if len(cur):
         cur = cur[cur["week"] == cur["week"].max()]
+        _ir = cur[(cur.get("report_primary_injury") == "Injured reserve") & (cur["snap6"] >= 0.5)]
+        if len(_ir):                                                  # which injured-reserve starters are counted, and at what weight
+            print("  Injured-reserve starters counted: " + "; ".join(
+                f"{x_['team']} {x_['pname']} ({x_['position']}) w={x_['w']:.2f}" for _, x_ in _ir.iterrows()))
         globals()["INJ_WEEK_NOW"] = int(cur["week"].max())
         print(f"  Injury data: latest week found is {INJ_WEEK_NOW} ({cur['team'].nunique()} teams have a listed player).")
         for _, x in cur.iterrows():
@@ -2179,9 +2212,17 @@ def build_injury_table(tg, pbp=None):
     inj["grp"] = inj["position"].map(pos_group)
     for g in INJ_GROUPS:
         inj[f"inj_{g}"] = np.where(inj["grp"] == g, inj["w"], 0.0)
-    inj["lost_share"] = np.where(inj["position"].isin(["WR", "TE"]), inj["wshare"].fillna(0.0) * inj["sev"], 0.0)
+    lost_raw = np.where(inj["position"].isin(["WR", "TE"]), inj["wshare"].fillna(0.0) * inj["sev"], 0.0)
+    inj["lost_share"] = lost_raw * np.where(inj["is_ir"], IR_WEIGHT_SCALE, 1.0)
+    # the same two numbers with injured reserve ignored (v0) or at half weight (v5), for the comparison table
+    for tag, sc in (("v0", 0.0), ("v5", 0.5)):
+        k = np.where(inj["is_ir"], sc, 1.0)
+        inj["w_" + tag] = inj["w_raw"] * k
+        inj["lost_" + tag] = lost_raw * k
     agg = (inj.groupby(["team", "season", "week"])
               .agg(qb_out=("qb_flag", "max"), inj_score=("w", "sum"), wr_lost=("lost_share", "sum"),
+                   inj_score_v0=("w_v0", "sum"), inj_score_v5=("w_v5", "sum"),
+                   wr_lost_v0=("lost_v0", "sum"), wr_lost_v5=("lost_v5", "sum"),
                    **{c: (c, "sum") for c in INJ_GROUP_COLS}).reset_index())
     return agg
 
@@ -2190,7 +2231,8 @@ def build_injury_table(tg, pbp=None):
 # 7. MATCHUP FEATURES
 # ----------------------------------------------------------------------------
 TEAM_FEATS = ["anya_off_pre", "anya_def_pre", "epa_off_pre", "epa_def_pre", "net_epa_pre",
-              "sos", "sos_adj_net_epa", "qb_out", "inj_score", "wr_lost", "hfa_pre"] + INJ_GROUP_COLS + [
+              "sos", "sos_adj_net_epa", "qb_out", "inj_score", "wr_lost", "inj_score_v0", "inj_score_v5", "wr_lost_v0", "wr_lost_v5",
+              "hfa_pre"] + INJ_GROUP_COLS + [
               "rz_off_pre", "rz_def_pre", "tov_margin_pre", "expl_off_pre", "expl_def_pre",
               "succ_off_pre", "succ_def_pre", "off_unit", "def_unit", "off_rank", "def_rank",
               "qb_q", "qb_pr", "plays_pre", "go_pre", "cont", "newqb",
@@ -2233,6 +2275,9 @@ def build_matchups(sched, tg, elo):
     g["qb_out_diff"] = g["a_qb_out"] - g["h_qb_out"]
     g["injury_score_diff"] = g["a_inj_score"] - g["h_inj_score"]
     g["wr_lost_diff"] = g["a_wr_lost"] - g["h_wr_lost"]
+    for _v in ("v0", "v5"):
+        g["injury_score_diff_" + _v] = g["a_inj_score_" + _v] - g["h_inj_score_" + _v]
+        g["wr_lost_diff_" + _v] = g["a_wr_lost_" + _v] - g["h_wr_lost_" + _v]
     for c in INJ_GROUP_COLS:                                  # by position group, Away minus Home
         g[c + "_diff"] = g["a_" + c] - g["h_" + c]
     g["qb_q_diff"] = g["h_qb_q"] - g["a_qb_q"]            # starting QB quality, Home minus Away
@@ -2494,6 +2539,11 @@ def compare_configs(games):
         im = GROUP_WEIGHT_MULTIPLIERS.get("Injuries", 1.0)
         cfgs += [("Injuries at half weight", active, True, 1.0, {"Injuries": im * 0.5}),
                  ("Injuries at 1.5x weight", active, True, 1.0, {"Injuries": im * 1.5})]
+    if INJURY_INCLUDE_IR and "Injuries" in active:      # do players on injured reserve help the model on past seasons?
+        sw0 = {"injury_score_diff": "injury_score_diff_v0", "wr_lost_diff": "wr_lost_diff_v0", "_swap": True}
+        sw5 = {"injury_score_diff": "injury_score_diff_v5", "wr_lost_diff": "wr_lost_diff_v5", "_swap": True}
+        cfgs += [("Same, ignoring injured-reserve players", active, True, 1.0, {"_swap": sw0}),
+                 ("Same, injured reserve at half weight", active, True, 1.0, {"_swap": sw5})]
     cfgs += [
             ("Same factors, all multipliers 1.0", active, False, 1.0),
             ("Same factors, stronger regularization", active, False, 0.05),
@@ -2510,6 +2560,9 @@ def compare_configs(games):
         feats = [f for f in allf if any(f in FEATURE_GROUPS[g] for g in groups if g in FEATURE_GROUPS)]
         if not feats:
             continue
+        ov0 = dict(ov[0]) if ov else {}
+        swap = ov0.pop("_swap", {})
+        swap = {k_: v_ for k_, v_ in swap.items() if k_ != "_swap"}
         ps, ys, vs = [], [], []
         for s_ in seasons:
             tr, te = done[done["season"] < s_], done[done["season"] == s_]
@@ -2517,15 +2570,17 @@ def compare_configs(games):
                 continue
             if use_mult:
                 fm_ = feature_multipliers(feats)
-                for grp_, mm_ in (ov[0].items() if ov else []):
+                for grp_, mm_ in ov0.items():
                     for f_ in FEATURE_GROUPS[grp_]:
                         if f_ in fm_:
                             fm_[f_] = mm_
-                m_ = AdjustedLogit(feats, fm_).fit(tr[feats], tr["home_win"])
+                fs_ = [swap.get(f_, f_) for f_ in feats]
+                m_ = AdjustedLogit(fs_, {swap.get(k_, k_): v_ for k_, v_ in fm_.items()}).fit(tr[fs_], tr["home_win"])
             else:
+                fs_ = [swap.get(f_, f_) for f_ in feats]
                 m_ = Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression(C=C, max_iter=2000))]
-                              ).fit(tr[feats], tr["home_win"])
-            ps.append(m_.predict_proba(te[feats])[:, 1])
+                              ).fit(tr[fs_], tr["home_win"])
+            ps.append(m_.predict_proba(te[fs_])[:, 1])
             ys.append(te["home_win"].values.astype(float))
             vs.append(te["vegas_home_prob"].values if "vegas_home_prob" in te.columns else np.full(len(te), np.nan))
         if not ps:
@@ -4654,9 +4709,11 @@ def main():
     for c in INJ_GROUP_COLS:
         if c not in tg.columns:
             tg[c] = 0.0
-    if "wr_lost" not in tg.columns:
-        tg["wr_lost"] = 0.0
-    tg[["qb_out", "inj_score", "wr_lost"] + INJ_GROUP_COLS] = tg[["qb_out", "inj_score", "wr_lost"] + INJ_GROUP_COLS].fillna(0)
+    _vc = ["inj_score_v0", "inj_score_v5", "wr_lost_v0", "wr_lost_v5"]
+    for c in ["wr_lost"] + _vc:
+        if c not in tg.columns:
+            tg[c] = 0.0
+    tg[["qb_out", "inj_score", "wr_lost"] + _vc + INJ_GROUP_COLS] = tg[["qb_out", "inj_score", "wr_lost"] + _vc + INJ_GROUP_COLS].fillna(0)
     tg = add_qb_quality(tg, pbp)
     tg = add_continuity(tg, pbp)
 
