@@ -88,6 +88,9 @@ LEAGUE_EPA = 0.0
 # recorded weather yet, so enter a forecast here to use it live, e.g. {"BUF@KC": {"temp": 22, "wind": 18}}
 # (key = "AWAY@HOME"). Games with no weather are treated as calm and mild. Domes / closed roofs ignore weather.
 WEATHER_OVERRIDES = {}
+WEATHER_FORECAST = True        # fetch a forecast (Open-Meteo, free, no key) for each outdoor game being predicted, show it on the
+                               # game card, and use it in the points total. Falls back to "calm and mild" if it cannot be reached.
+                               # An entry in WEATHER_OVERRIDES wins over the fetched forecast.
 WIND_FADE_WEEKS = 8            # roster-continuity effects fade out over the first this-many weeks of a season
 LEAGUE_GO_RATE = 0.30          # league rate of going for it on 4th-and-short near midfield (prior for each team)
 GO_PRIOR_TRIALS = 12
@@ -2150,6 +2153,7 @@ def build_matchups(sched, tg, elo):
         columns={c: "a_" + c for c in TEAM_FEATS})
     g = (sched[["game_id", "season", "week", "gameday", "home_team", "away_team",
                 "home_score", "away_score", "result", "location"]
+               + [c for c in ("gametime",) if c in sched.columns]
                + [c for c in ("spread_line", "total_line", "home_moneyline", "away_moneyline", "roof", "temp", "wind")
                   if c in sched.columns]]
          .merge(h, on="game_id").merge(a, on="game_id"))
@@ -2920,6 +2924,55 @@ def build_why(r, gc, hist):
     return dict(word=confidence_words(pp), pick=P, other=O, pp=pp, reasons=reasons, concerns=concerns, hist=hist_txt, shifts=shifts)
 
 
+def fetch_forecasts(wk):
+    """
+    {game_id: {"temp": F, "wind": mph, "gust": mph, "rain": chance %, "dome": bool}} at kickoff for each unplayed game.
+    Open-Meteo hourly forecast at the home stadium. Domes / closed roofs are marked and not fetched. Anything that fails
+    simply has no entry (the model then treats that game as calm and mild).
+    """
+    import json
+    from datetime import timedelta, timezone
+    out = {}
+    if not WEATHER_FORECAST:
+        return out
+    for r in wk.itertuples():
+        if pd.notna(r.result):
+            continue
+        roof = str(getattr(r, "roof", "") or "").lower()
+        if roof in ("dome", "closed"):
+            out[r.game_id] = {"dome": True}
+            continue
+        lat_lon = TEAM_COORDS.get(r.home_team)
+        if lat_lon is None or str(getattr(r, "location", "Home")) == "Neutral":
+            continue
+        try:
+            day = pd.to_datetime(r.gameday)
+            hh, mm = (str(getattr(r, "gametime", "13:00") or "13:00").split(":") + ["0"])[:2]
+            ko_et = day.to_pydatetime().replace(hour=int(hh), minute=int(mm))
+            # gametime is Eastern: UTC-5 after the clocks go back (early Nov), UTC-4 before (approx. DST by date)
+            is_dst = pd.Timestamp(ko_et).month in (3, 4, 5, 6, 7, 8, 9, 10) and not (pd.Timestamp(ko_et).month == 3 and pd.Timestamp(ko_et).day < 9)
+            ko_utc = ko_et + timedelta(hours=4 if is_dst else 5)
+            if (ko_utc - datetime.utcnow()).days > 14:
+                continue
+            url = ("https://api.open-meteo.com/v1/forecast?latitude={:.3f}&longitude={:.3f}"
+                   "&hourly=temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation_probability"
+                   "&temperature_unit=fahrenheit&wind_speed_unit=mph&forecast_days=16&timezone=UTC").format(*lat_lon)
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                d = json.loads(resp.read().decode("utf-8"))["hourly"]
+            want = ko_utc.strftime("%Y-%m-%dT%H:00")
+            i = d["time"].index(want)
+            hrs = range(i, min(i + 3, len(d["time"])))                     # about the length of the game
+            g_ = lambda k: [d[k][j] for j in hrs if d.get(k) and d[k][j] is not None]
+            out[r.game_id] = {"temp": float(np.mean(g_("temperature_2m"))), "wind": float(np.mean(g_("wind_speed_10m"))),
+                              "gust": float(np.max(g_("wind_gusts_10m"))), "rain": float(np.max(g_("precipitation_probability"))),
+                              "dome": False}
+        except Exception as ex:
+            print(f"  ! no forecast for {r.away_team} @ {r.home_team} ({ex})")
+    got = sum(1 for v in out.values() if not v.get("dome") and "temp" in v)
+    print(f"Weather forecasts: {got} outdoor game(s) found" + ("" if got else " (none; treating games as calm and mild)"))
+    return out
+
+
 def predict_upcoming(model, games, report):
     feats = model_features()
     pending = games[(games["season"] == PREDICT_SEASON) & games["result"].isna()]
@@ -2936,6 +2989,15 @@ def predict_upcoming(model, games, report):
     wk = games[(games["season"] == PREDICT_SEASON) & (games["week"] == week)].sort_values(
         ["gameday", "home_team"]).copy()
 
+    wxf = fetch_forecasts(wk)
+    for gid_, v_ in wxf.items():                       # forecast replaces "calm and mild" (manual entries in WEATHER_OVERRIDES win)
+        m_ = wk["game_id"] == gid_
+        key_ = (wk.loc[m_, "away_team"] + "@" + wk.loc[m_, "home_team"]).iloc[0]
+        if v_.get("dome") or key_ in WEATHER_OVERRIDES or "temp" not in v_:
+            continue
+        wk.loc[m_, "wx_wind"] = v_["wind"]
+        wk.loc[m_, "wx_cold"] = max(45.0 - v_["temp"], 0.0)
+        wk.loc[m_, "wx_wind_x_qb"] = v_["wind"] * wk.loc[m_, "qb_q_diff"]
     wk["p_home"] = model.predict_proba(wk[feats])[:, 1]
     _sty = {}
     _ssn = games[games["season"] == PREDICT_SEASON]
@@ -3062,6 +3124,10 @@ def predict_upcoming(model, games, report):
                  a_cm=r.a_common_margin, h_cm=r.h_common_margin,
                  a_ce=r.a_common_epa, h_ce=r.h_common_epa,
                  why=(build_why(r, _gc.loc[r.Index].to_dict(), report.get("conf_hist")) if _gc is not None else None),
+                 wx=wxf.get(r.game_id) or ({"temp": float(r.temp), "wind": float(r.wind), "dome": False, "recorded": True}
+                                           if (pd.notna(getattr(r, "temp", np.nan)) and pd.notna(getattr(r, "wind", np.nan))
+                                               and str(getattr(r, "roof", "")).lower() not in ("dome", "closed")) else None),
+                 roof_=str(getattr(r, "roof", "") or "").lower(),
                  played=bool(pd.notna(r.result)), final_a=r.away_score, final_h=r.home_score,
                  pred_margin=float(r.pred_margin),
                  v_ml_home=getattr(r, "home_moneyline", np.nan), v_ml_away=getattr(r, "away_moneyline", np.nan),
@@ -3509,6 +3575,8 @@ details>summary::-webkit-details-marker{display:none}
 .vegas .sub{display:block;color:var(--muted);font-size:12px;margin-top:3px}
 .vegas .flag{display:inline-block;white-space:nowrap;margin-top:4px;padding:1px 7px;border-radius:999px;background:#d98a1f22;color:#d98a1f;font-size:11.5px;font-weight:700}
 .imp.high{color:#c0392b;font-weight:800}.imp.medium{color:#d98a1f;font-weight:700}.imp.low,.imp.none,.imp.not{color:var(--muted)}
+.wxbox{border:1px solid var(--line);border-radius:10px;padding:9px 12px;margin:0 0 10px;font-size:13.5px;line-height:1.45}
+.wxbox .wxsrc{color:var(--muted);font-size:12px}
 .whybox{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 12px}
 .whybox ul{margin:6px 0 0;padding-left:18px}.whybox li{margin:5px 0;font-size:13.5px;line-height:1.4}
 .shifts{display:flex;flex-wrap:wrap;gap:5px}.shift{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--bar);color:var(--muted)}
@@ -3928,6 +3996,33 @@ def write_html_report(pred, report, elo_ratings, season_stats=None, logos=None, 
         return ('<div class="stylebox"><b>Notable matchups</b> <span style="font-size:11.5px">(last 8 games, vs league average; '
                 'shown for context, not used in the pick)</span>' + "".join(f"<div>&bull; {e(t)}</div>" for t, _ in n) + "</div>")
 
+    def weather_box(r):
+        w = r.get("wx")
+        if not w:
+            return ('<div class="wxbox"><b>Weather</b> no forecast available; the model treats this game as calm and mild.</div>'
+                    if not r.get("played") and r.get("roof_") not in ("dome", "closed") else "")
+        if w.get("dome"):
+            return '<div class="wxbox"><b>Weather</b> indoors (dome or closed roof), so weather does not matter.</div>'
+        t_, wd_ = w["temp"], w["wind"]
+        tags = []
+        if wd_ >= 15:
+            tags.append("windy: hurts passing and kicking")
+        elif wd_ >= 10:
+            tags.append("breezy")
+        if t_ <= 32:
+            tags.append("freezing")
+        elif t_ <= 40:
+            tags.append("cold")
+        elif t_ >= 85:
+            tags.append("hot")
+        if w.get("rain") is not None and w["rain"] >= 50:
+            tags.append(f"{w['rain']:.0f}% chance of precipitation")
+        gust = f", gusts to {w['gust']:.0f}" if w.get("gust") and w["gust"] >= wd_ + 5 else ""
+        src = "recorded at the game" if w.get("recorded") else "forecast at kickoff"
+        tag = f' &middot; <b>{e("; ".join(tags))}</b>' if tags else " &middot; no weather concerns"
+        return (f'<div class="wxbox"><b>Weather</b> {t_:.0f}&deg;F, wind {wd_:.0f} mph{e(gust)}{tag} '
+                f'<span class="wxsrc">({src})</span></div>')
+
     def why_html(r):
         w = r.get("why")
         if not w:
@@ -4105,6 +4200,7 @@ def write_html_report(pred, report, elo_ratings, season_stats=None, logos=None, 
 </div>
 <nav class="subtabs"><button type="button" data-t="over">Overview</button><button type="button" data-t="match">Matchups</button><button type="button" data-t="stats">Team stats</button><button type="button" data-t="inj">Injuries{inj_count(r)}</button>{players_btn}</nav>
 <div class="tp" data-t="over">
+  {weather_box(r)}
   {why_html(r)}
   {style_html(r)}
   <div class="probline">Win probability: {e(r["away"])} {100 - r["p_home"] * 100:.1f}% &middot; {e(r["home"])} {r["p_home"] * 100:.1f}%.{vegas_line(r)}</div>
