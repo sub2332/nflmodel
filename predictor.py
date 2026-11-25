@@ -329,7 +329,7 @@ INJURY_RECEIVING_SHARE = True  # its own factor: the share of a team's targets t
                                # (so losing a 40%-of-targets star with nobody behind him hurts a lot)
 INJURY_INCLUDE_IR = True       # players on injured reserve (roster status "RES") count as Out for the week being predicted.
                                # The weekly injury report does not list them, so without this a star on IR would be invisible.
-IR_WEIGHT_SCALE = 1.0          # how much a player on injured reserve counts compared with the same player listed Out (1.0 = fully;
+IR_WEIGHT_SCALE = 0.5          # how much a player on injured reserve counts compared with the same player listed Out (1.0 = fully;
                                # the "injured reserve" rows of the comparison table test 0 and 0.5 on past seasons)
 INJURY_BY_POSITION = not INJURY_PLAYER_IMPACT
 KEY_PLAYER_W = 1.2             # a missing player at or above this weight is called out by name on the game cards
