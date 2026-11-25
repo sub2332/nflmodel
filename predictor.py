@@ -3931,7 +3931,7 @@ def build_injury_reports(pred):
             if not gs and pr in ("", "Full"):
                 continue                                      # a full-practice player with no game designation is not news
             w_ = INJ_IMPACT_NOW.get((t, x.get("gsis_id")))
-            if (ij_c is not None and str(x[ij_c]) == "Injured reserve") and not w_:
+            if (ij_c is not None and str(x[ij_c]) == "Injured reserve") and not (w_ is not None and w_ == w_ and w_ > 0):
                 continue                      # injured reserve: only list players the model counts (not backups / practice squad)
             if w_ is None:
                 imp = "not counted" if gs not in ("Out", "Doubtful") else "-"
