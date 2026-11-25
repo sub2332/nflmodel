@@ -3299,6 +3299,24 @@ def predict_upcoming(model, games, report):
     if no_injuries:
         print("  ! No Out/Doubtful injuries found for this week (report may not be published yet).")
 
+    # ---- schedule faced so far (league rank) and each team's last five results, for the Overview tab ----
+    _sos_rk, _last5 = {}, {}
+    try:
+        _sg = games[(games["season"] == PREDICT_SEASON) & (games["week"] <= week)]
+        _st = pd.concat([_sg[["week", "home_team", "h_sos", "h_net_epa_pre"]].set_axis(["week", "team", "sos", "net"], axis=1),
+                         _sg[["week", "away_team", "a_sos", "a_net_epa_pre"]].set_axis(["week", "team", "sos", "net"], axis=1)])
+        _sos_rk = _st.sort_values("week").groupby("team")["sos"].last().rank(ascending=False, method="min").to_dict()
+        _st["net_rk"] = _st.groupby("week")["net"].rank(ascending=False, method="min")          # opponent's strength rank that week
+        _nrk = {(w_, t_): k_ for w_, t_, k_ in zip(_st["week"], _st["team"], _st["net_rk"])}
+        _done = games[(games["season"] == PREDICT_SEASON) & (games["week"] < week) & games["result"].notna()].sort_values(["week", "gameday"])
+        for g_ in _done.itertuples():
+            for me, opp, pf, pa, home in ((g_.home_team, g_.away_team, g_.home_score, g_.away_score, True),
+                                          (g_.away_team, g_.home_team, g_.away_score, g_.home_score, False)):
+                _last5.setdefault(me, []).append(dict(week=int(g_.week), opp=opp, home=home, pf=int(pf), pa=int(pa),
+                                                      opp_rk=_nrk.get((g_.week, opp))))
+        _last5 = {k_: v_[-5:] for k_, v_ in _last5.items()}
+    except Exception as ex:
+        print(f"  ! schedule and last-five details unavailable ({ex})")
     rows = [dict(away=r.away_team, home=r.home_team, winner=r.winner, p_home=r.p_home,
                  score_a=int(r.score_away), score_h=int(r.score_home),
                  n_common=int(r.n_common_opps),
@@ -3308,7 +3326,8 @@ def predict_upcoming(model, games, report):
                  a_epa_off=r.a_epa_off_pre, h_epa_off=r.h_epa_off_pre,
                  a_epa_def=r.a_epa_def_pre, h_epa_def=r.h_epa_def_pre,
                  a_net=r.a_net_epa_pre, h_net=r.h_net_epa_pre,
-                 a_sos=r.a_sos, h_sos=r.h_sos,
+                 a_sos=r.a_sos, h_sos=r.h_sos, a_sos_rk=_sos_rk.get(r.away_team), h_sos_rk=_sos_rk.get(r.home_team),
+                 a_last5=_last5.get(r.away_team, []), h_last5=_last5.get(r.home_team, []),
                  a_sosadj=r.a_sos_adj_net_epa, h_sosadj=r.h_sos_adj_net_epa,
                  a_hfa=r.a_hfa_pre, h_hfa=r.h_hfa_pre,
                  a_inj=r.a_inj_score, h_inj=r.h_inj_score,
@@ -3813,6 +3832,7 @@ table.cmp th.tm{text-align:center;font-size:13px;color:var(--text)}
 table.cmp tr.sec td{background:var(--bg);color:var(--muted);font-size:11px;font-weight:700;
 text-transform:uppercase;letter-spacing:.06em;text-align:left}
 .rk{font-size:11px;margin-left:5px;font-weight:600}
+.l5 summary{cursor:pointer}.l5 div{font-size:12.5px;line-height:1.5;text-align:left}.l5 .gw{color:var(--pos)}.l5 .gl{color:var(--neg)}
 .rk.good{color:var(--pos)}.rk.bad{color:var(--neg)}.rk.mid{color:var(--muted)}
 .scroll{overflow-x:auto}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
@@ -4178,6 +4198,25 @@ def write_html_report(pred, report, elo_ratings, season_stats=None, logos=None, 
             ra, rh = a[col + "_rk"], h[col + "_rk"]
             rows.append(cmp_row(label, fmt(a[col], f) + rank_badge(ra), fmt(h[col], f) + rank_badge(rh),
                                 better(ra, rh, higher=False)))
+        # schedule faced so far: #1 = the toughest in the league (no green / red, since a tough schedule is context, not a flaw)
+        rows.append(cmp_row("Schedule faced so far (#1 = toughest)", fmt(r["a_sos"], "{:+.3f}") + rank_badge(r.get("a_sos_rk")),
+                            fmt(r["h_sos"], "{:+.3f}") + rank_badge(r.get("h_sos_rk"))))
+
+        def l5(lst):
+            if not lst:
+                return '<span class="note">no games yet</span>'
+            res = ["W" if g["pf"] > g["pa"] else ("L" if g["pf"] < g["pa"] else "T") for g in lst]
+            w_, l_ = res.count("W"), res.count("L")
+            head = f'{w_}&ndash;{l_}' + (f'&ndash;{res.count("T")}' if "T" in res else "") + f' &middot; {"".join(res)}'
+            def line(g, x):
+                rk_ = g.get("opp_rk")
+                ob = "" if rk_ is None or pd.isna(rk_) else f' <span class="rk mid">opp #{int(rk_)}</span>'
+                cls = "gw" if x == "W" else ("gl" if x == "L" else "")
+                return (f'<div><b class="{cls}">{x}</b> {g["pf"]}&ndash;{g["pa"]} {"vs" if g["home"] else "@"} {e(g["opp"])}'
+                        f'{ob} <span class="note">wk {g["week"]}</span></div>')
+            body = "".join(line(g, x) for g, x in zip(lst, res))
+            return f'<details class="l5"><summary>{head}</summary>{body}</details>'
+        rows.append(cmp_row("Last 5 games (tap to open)", l5(r.get("a_last5")), l5(r.get("h_last5"))))
         return (f'<table class="cmp"><tr><th class="tm">{tm(r["away"])}</th><th></th>'
                 f'<th class="tm">{tm(r["home"])}</th></tr>{"".join(rows)}</table>')
 
