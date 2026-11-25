@@ -1,0 +1,67 @@
+# Rebuilds the NFL predictions page on a schedule and publishes it with GitHub Pages.
+# Put this file in your repo at:  .github/workflows/update.yml
+name: Update NFL predictions
+
+on:
+  schedule:
+    # Times are UTC (Central time is 5-6 hours earlier). Only September through February.
+    - cron: "17 15 * 9-12,1,2 2"    # Tuesday morning: Monday night is over, the new week appears
+    - cron: "43 22 * 9-12,1,2 3"    # Wednesday afternoon: first practice reports
+    - cron: "11 20 * 9-12,1,2 4"    # Thursday afternoon: more practice reports
+    - cron: "37 23 * 9-12,1,2 5"    # Friday evening: final game designations (Questionable / Out)
+    - cron: "23 16 * 9-12,1,2 0"    # Sunday morning: last check before kickoff
+  workflow_dispatch:                 # lets you press "Run workflow" by hand (Actions tab)
+    inputs:
+      week:
+        description: "Week to predict: leave blank for automatic, or type next, or a number like 13"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install libraries
+        run: pip install -r requirements.txt
+
+      - name: Build the page
+        env:
+          NFL_OUTPUT_PATH: site/index.html
+          NFL_PREDICT_WEEK: ${{ github.event.inputs.week }}
+        run: python predictor.py
+
+      - name: Placeholder if there was nothing to predict
+        run: |
+          mkdir -p site
+          test -f site/index.html || echo "<p style='font-family:sans-serif'>No games to predict right now.</p>" > site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
