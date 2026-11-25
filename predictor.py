@@ -2206,8 +2206,10 @@ def build_injury_table(tg, pbp=None):
         for _, x in cur.iterrows():
             INJ_IMPACT_NOW[(x["team"], x["gsis_id"])] = float(x["w"])
             if x["position"] in ("WR", "TE") and pd.notna(x.get("wshare")) and x["wshare"] > 0:
-                sh_ = float(x["wshare"]) * float(x["sev"]) * (IR_WEIGHT_SCALE if x.get("is_ir") else 1.0)
-                INJ_LOST_NOW.setdefault(x["team"], []).append((sh_, x["pname"], "injured reserve" if x.get("is_ir") else x["status"]))
+                sh_ = float(x["wshare"])                  # his real share of the team's targets (what is shown on the card)
+                lab_ = ("injured reserve, counted at " + f"{IR_WEIGHT_SCALE * 100:.0f}%" + " in the model") if (x.get("is_ir") and IR_WEIGHT_SCALE != 1.0) \
+                    else ("injured reserve" if x.get("is_ir") else x["status"])
+                INJ_LOST_NOW.setdefault(x["team"], []).append((sh_, x["pname"], lab_))
             if x["w"] >= KEY_PLAYER_W and x["pname"]:
                 INJ_KEY_NOW.setdefault(x["team"], []).append((float(x["w"]), x["pname"], x["position"], x["status"]))
         for t_ in INJ_KEY_NOW:
@@ -2983,9 +2985,12 @@ def build_why(r, gc, hist):
         # the players behind the number, biggest first; the report turns this tail into a dropdown under the sentence
         k = [(sh, n_, st) for sh, n_, st in INJ_LOST_NOW.get(team, []) if sh >= 0.005][:8]
         return ("\x1f" + "\x1e".join(f"{n_}: {sh * 100:.1f}% of targets ({st})" for sh, n_, st in k)) if k else ""
-    lo_, lp_ = float(g(opp, "wr_lost") or 0), float(g(pre, "wr_lost") or 0)
+    lo_, lp_ = float(g(opp, "wr_lost") or 0), float(g(pre, "wr_lost") or 0)     # what the model counts (injured reserve reduced)
+    def shown_pct(team, fallback):                    # what the card says: the real share of targets the missing receivers had
+        k = INJ_LOST_NOW.get(team)
+        return sum(sh for sh, _, _ in k) if k else fallback
     if lo_ >= 0.15:
-        reasons.append((0.3 + lo_, f"{O} is missing receivers who had about {lo_ * 100:.0f}% of their targets." + lost_names(O)))
+        reasons.append((0.3 + lo_, f"{O} is missing receivers who had about {shown_pct(O, lo_) * 100:.0f}% of their targets." + lost_names(O)))
     if ko_o:
         reasons.append((0.3 + sum(w_ for w_, *_ in INJ_KEY_NOW.get(O, [])[:3]) / 10, f"{O} is missing key players: {ko_o}."))
     reasons.sort(key=lambda t: -t[0])
@@ -3011,7 +3016,7 @@ def build_why(r, gc, hist):
     if int(g(pre, "qb_out")):
         cs.append((1.0, f"{P}'s usual starting quarterback is listed out, so the rating may overstate them."))
     if lp_ >= 0.15:
-        cs.append((0.8 + lp_, f"{P} is missing receivers who had about {lp_ * 100:.0f}% of their targets." + lost_names(P)))
+        cs.append((0.8 + lp_, f"{P} is missing receivers who had about {shown_pct(P, lp_) * 100:.0f}% of their targets." + lost_names(P)))
     if ko_p:
         cs.append((0.8 + sum(w_ for w_, *_ in INJ_KEY_NOW.get(P, [])[:3]) / 10, f"{P} is missing key players: {ko_p}."))
     if g(pre, "def_rank") >= 22:
