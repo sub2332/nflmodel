@@ -336,6 +336,7 @@ KEY_PLAYER_W = 1.2             # a missing player at or above this weight is cal
 INJ_WEEK_NOW = 0               # the week those two tables belong to
 INJ_KEY_NOW = {}               # {team: [(weight, name, position, status)]} for the week being predicted (filled by build_injury_table)
 INJ_IMPACT_NOW = {}            # {(team, gsis_id): weight} same week, used by the injury report tables
+INJ_LOST_NOW = {}              # {team: [(share of targets counted, name, status)]} receivers who are out, same week
 INJ_GROUPS = {"ol": ["T", "OT", "LT", "RT", "G", "OG", "C", "OL"],
               "dl": ["DE", "OLB", "EDGE", "DT", "NT", "DL"],
               "lb": ["LB", "ILB", "MLB"],
@@ -2192,6 +2193,7 @@ def build_injury_table(tg, pbp=None):
     # remember this week's missing players (for names on the game cards and the impact column in the injury report)
     INJ_KEY_NOW.clear()
     INJ_IMPACT_NOW.clear()
+    INJ_LOST_NOW.clear()
     cur = inj[inj["season"] == PREDICT_SEASON]
     if len(cur):
         cur = cur[cur["week"] == cur["week"].max()]
@@ -2203,10 +2205,15 @@ def build_injury_table(tg, pbp=None):
         print(f"  Injury data: latest week found is {INJ_WEEK_NOW} ({cur['team'].nunique()} teams have a listed player).")
         for _, x in cur.iterrows():
             INJ_IMPACT_NOW[(x["team"], x["gsis_id"])] = float(x["w"])
+            if x["position"] in ("WR", "TE") and pd.notna(x.get("wshare")) and x["wshare"] > 0:
+                sh_ = float(x["wshare"]) * float(x["sev"]) * (IR_WEIGHT_SCALE if x.get("is_ir") else 1.0)
+                INJ_LOST_NOW.setdefault(x["team"], []).append((sh_, x["pname"], "injured reserve" if x.get("is_ir") else x["status"]))
             if x["w"] >= KEY_PLAYER_W and x["pname"]:
                 INJ_KEY_NOW.setdefault(x["team"], []).append((float(x["w"]), x["pname"], x["position"], x["status"]))
         for t_ in INJ_KEY_NOW:
             INJ_KEY_NOW[t_].sort(key=lambda z: -z[0])
+        for t_ in INJ_LOST_NOW:
+            INJ_LOST_NOW[t_].sort(key=lambda z: -z[0])
     inj["qb_flag"] = ((inj["position"] == "QB") & (inj["gsis_id"] == inj["qb_id"])).astype(int)
     pos_group = {p: g for g, ps in INJ_GROUPS.items() for p in ps}
     inj["grp"] = inj["position"].map(pos_group)
@@ -2972,9 +2979,13 @@ def build_why(r, gc, hist):
         k = [z for z in INJ_KEY_NOW.get(team, []) if z[2] != "QB"][:3]       # a missing QB has its own line
         return ", ".join(f"{n_} ({p_}, {st_})" for _, n_, p_, st_ in k)
     ko_o, ko_p = key_out(O), key_out(P)
+    def lost_names(team):
+        # the players behind the number, biggest first; the report turns this tail into a dropdown under the sentence
+        k = [(sh, n_, st) for sh, n_, st in INJ_LOST_NOW.get(team, []) if sh >= 0.005][:8]
+        return ("\x1f" + "\x1e".join(f"{n_}: {sh * 100:.1f}% of targets ({st})" for sh, n_, st in k)) if k else ""
     lo_, lp_ = float(g(opp, "wr_lost") or 0), float(g(pre, "wr_lost") or 0)
     if lo_ >= 0.15:
-        reasons.append((0.3 + lo_, f"{O} is missing receivers who had about {lo_ * 100:.0f}% of their targets."))
+        reasons.append((0.3 + lo_, f"{O} is missing receivers who had about {lo_ * 100:.0f}% of their targets." + lost_names(O)))
     if ko_o:
         reasons.append((0.3 + sum(w_ for w_, *_ in INJ_KEY_NOW.get(O, [])[:3]) / 10, f"{O} is missing key players: {ko_o}."))
     reasons.sort(key=lambda t: -t[0])
@@ -3000,7 +3011,7 @@ def build_why(r, gc, hist):
     if int(g(pre, "qb_out")):
         cs.append((1.0, f"{P}'s usual starting quarterback is listed out, so the rating may overstate them."))
     if lp_ >= 0.15:
-        cs.append((0.8 + lp_, f"{P} is missing receivers who had about {lp_ * 100:.0f}% of their targets."))
+        cs.append((0.8 + lp_, f"{P} is missing receivers who had about {lp_ * 100:.0f}% of their targets." + lost_names(P)))
     if ko_p:
         cs.append((0.8 + sum(w_ for w_, *_ in INJ_KEY_NOW.get(P, [])[:3]) / 10, f"{P} is missing key players: {ko_p}."))
     if g(pre, "def_rank") >= 22:
@@ -3690,6 +3701,7 @@ details>summary::-webkit-details-marker{display:none}
 .imp.high{color:#c0392b;font-weight:800}.imp.medium{color:#d98a1f;font-weight:700}.imp.low,.imp.none,.imp.not{color:var(--muted)}
 .wxbox{border:1px solid var(--line);border-radius:10px;padding:9px 12px;margin:0 0 10px;font-size:13.5px;line-height:1.45}
 .wxbox .wxsrc{color:var(--muted);font-size:12px}
+.why-det summary{cursor:pointer}.why-det ol{margin:4px 0 2px;padding-left:22px;color:var(--muted);font-size:12.5px}
 .whybox{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:0 0 12px}
 .whybox ul{margin:6px 0 0;padding-left:18px}.whybox li{margin:5px 0;font-size:13.5px;line-height:1.4}
 .shifts{display:flex;flex-wrap:wrap;gap:5px}.shift{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--bar);color:var(--muted)}
@@ -4143,7 +4155,13 @@ def write_html_report(pred, report, elo_ratings, season_stats=None, logos=None, 
         w = r.get("why")
         if not w:
             return ""
-        li = lambda xs: "".join(f"<li>{e(t)}</li>" for t in xs)
+        def li1(t):
+            if "\x1f" in t:                                   # a sentence with the list of players behind it: a dropdown
+                head, det = t.split("\x1f", 1)
+                return (f'<li><details class="why-det"><summary>{e(head)}</summary><ol>'
+                        + "".join(f"<li>{e(d)}</li>" for d in det.split("\x1e")) + '</ol></details></li>')
+            return f"<li>{e(t)}</li>"
+        li = lambda xs: "".join(li1(t) for t in xs)
         hist = f'<p class="whyhist">{e(w["hist"])}</p>' if w["hist"] else ""
         chips = "".join(f'<span class="shift {"up" if v_ >= 0.05 else ("dn" if v_ <= -0.05 else "")}">{e(n_)} {v_:+.1f}</span>' for n_, v_ in w.get("shifts", []))
         if chips:
